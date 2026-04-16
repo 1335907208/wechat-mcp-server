@@ -1,0 +1,25 @@
+[project]
+name = "wechat-cli-mcp"
+version = "0.2.0"
+description = "MCP server for WeChat - Query local WeChat data with skill distillation and message listening"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "mcp>=1.0.0",
+    "watchdog>=3.0.0",
+    "openai>=1.0.0",
+    "anthropic>=0.18.0",
+    "jinja2>=3.1.0",
+    "pillow>=10.0.0",
+    "click>=8.1,<9",
+    "pycryptodome>=3.19,<4",
+    "zstandard>=0.22,<1",
+]
+
+[project.scripts]
+wechat-cli-mcp = "wechat_cli_mcp:main"
+wechat-listen = "wechat_cli_mcp.cli_listen:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
