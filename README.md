@@ -1,8 +1,6 @@
-# wechat-cli-mcp
+# wechat-mcp-server
 
 一个用于读取本机微信数据的 MCP Server：让 Claude Code 等 AI 助手可以通过 MCP 工具读取聊天记录/会话/联系人/收藏等。
-
-本项目**可独立部署**：已内置核心逻辑，不需要额外安装 `wechat-cli`。
 
 ## 功能特性
 
