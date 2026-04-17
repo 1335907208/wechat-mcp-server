@@ -105,47 +105,88 @@ class SkillDistiller:
     
     def fetch_chat_history(self, chat_name: str, limit: int = 1000) -> List[Dict[str, Any]]:
         """Fetch chat history using wechat-cli core functions"""
-        try:
-            from .context import get_context
-            from .core.messages import resolve_chat_context, collect_chat_history
-            
-            ctx = get_context()
-            chat_ctx = resolve_chat_context(chat_name, ctx.msg_db_keys, ctx.cache, ctx.decrypted_dir)
-            if not chat_ctx or not chat_ctx.get('db_path'):
-                return []
-            
-            names = ctx.get_contact_names()
-            lines, _ = collect_chat_history(
-                chat_ctx, names, ctx.display_name_for_username,
-                start_ts=None, end_ts=None, limit=limit, offset=0,
-                msg_type_filter=None, resolve_media=False, db_dir=ctx.db_dir,
-            )
-            
-            # Parse lines into message format
-            messages = []
-            for line in lines:
-                # Format: "[YYYY-MM-DD HH:MM] sender: content"
-                import re
-                match = re.match(r'\[([^\]]+)\]\s*(.+?):\s*(.+)', line)
-                if match:
-                    time_str, sender, content = match.groups()
-                    messages.append({
-                        'content': content,
-                        'sender': sender,
-                        'is_self': sender == 'me',
-                        'create_time': 0,  # Would need proper timestamp parsing
-                        'type': 'text'
-                    })
-            return messages
-        
-        except Exception as e:
-            print(f"Error fetching history: {e}")
-        
-        return []
+        from .context import get_context
+        from .core.messages import resolve_chat_context, collect_chat_history
+
+        ctx = get_context()
+        chat_ctx = resolve_chat_context(chat_name, ctx.msg_db_keys, ctx.cache, ctx.decrypted_dir)
+        if not chat_ctx:
+            raise ValueError(f"Chat not found: {chat_name}")
+        if not chat_ctx.get('db_path'):
+            raise ValueError(f"No message records for: {chat_name}")
+
+        names = ctx.get_contact_names()
+        lines, _ = collect_chat_history(
+            chat_ctx, names, ctx.display_name_for_username,
+            start_ts=None, end_ts=None, limit=limit, offset=0,
+            msg_type_filter=None, resolve_media=False, db_dir=ctx.db_dir,
+        )
+
+        is_group = chat_ctx.get('is_group', False)
+        # Line formats:
+        #   Group:  "[YYYY-MM-DD HH:MM] sender: content"
+        #   Private (self): "[YYYY-MM-DD HH:MM] content"  (no sender label)
+        #   Private (other): "[YYYY-MM-DD HH:MM] Name: content"
+        line_pattern = re.compile(r'\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2})\]\s*(?:(.+?):\s*)?(.+)')
+        messages = []
+        for line in lines:
+            match = line_pattern.match(line)
+            if not match:
+                continue
+            time_str, sender, content = match.groups()
+            # In private chats, self messages have no sender label
+            is_self = (sender == 'me') if sender else (not is_group and sender is None)
+            if sender is None:
+                sender = 'me' if not is_group else ''
+            # Parse timestamp
+            create_time = 0
+            try:
+                dt = datetime.strptime(time_str, '%Y-%m-%d %H:%M')
+                create_time = int(dt.timestamp())
+            except ValueError:
+                pass
+            # Detect message type from content
+            msg_type = 'text'
+            if content.startswith('[图片]'):
+                msg_type = 'image'
+            elif content.startswith('[表情]'):
+                msg_type = 'sticker'
+            elif content.startswith('[链接/文件]'):
+                msg_type = 'link'
+            elif content.startswith('[通话]'):
+                msg_type = 'voip'
+            elif content.startswith('[系统]') or content.startswith('[文件]'):
+                msg_type = 'system'
+            # Skip system messages, revoke messages, and XML content
+            if msg_type == 'system':
+                continue
+            if 'revokemsg' in content or '你撤回了一条消息' in content:
+                continue
+            if content.strip().startswith('<?xml'):
+                continue
+            # Skip淘宝/电商链接 (not conversational)
+            if '【淘宝】' in content or 'e.tb.cn' in content:
+                continue
+            # For image/sticker/link/voip, use tag as content summary
+            if msg_type != 'text':
+                display_content = content
+            else:
+                display_content = content
+            messages.append({
+                'content': display_content,
+                'sender': sender,
+                'is_self': is_self,
+                'create_time': create_time,
+                'type': msg_type,
+            })
+        return messages
     
-    def filter_my_messages(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Filter messages sent by self"""
-        return [m for m in messages if m.get('is_self', False)]
+    def filter_my_messages(self, messages: List[Dict[str, Any]], text_only: bool = False) -> List[Dict[str, Any]]:
+        """Filter messages sent by self, optionally text-only"""
+        result = [m for m in messages if m.get('is_self', False)]
+        if text_only:
+            result = [m for m in result if m.get('type', 'text') == 'text']
+        return result
     
     def calculate_statistics(self, messages: List[Dict[str, Any]], my_messages: List[Dict[str, Any]]) -> StyleStatistics:
         """Calculate statistical metrics"""
@@ -264,26 +305,33 @@ class SkillDistiller:
         content_lower = content.lower()
         
         # Technical keywords
-        tech_keywords = ['code', 'bug', 'api', 'function', 'class', 'error', 'fix', 'implement', 'python', 'javascript', 'java']
+        tech_keywords = ['code', 'bug', 'api', 'function', 'class', 'error', 'fix', 'implement',
+                         'python', 'javascript', 'java', 'deploy', 'server', 'config', 'debug',
+                         '代码', '部署', '服务器', '配置', '调试', '修复', '接口', '测试']
         if any(kw in content_lower for kw in tech_keywords):
             return 'technical'
         
         # Agreement
-        agreement_keywords = ['ok', 'yes', 'good', 'sure', 'right', 'agree', 'fine', 'deal', 'no problem']
+        agreement_keywords = ['ok', 'yes', 'good', 'sure', 'right', 'agree', 'fine', 'deal',
+                              'no problem', '好的', '嗯', '行', '可以', '没问题', '收到', '谢谢',
+                              '了解', '明白', '同意']
         if any(kw in content_lower for kw in agreement_keywords):
             return 'agreement'
         
         # Refusal
-        refusal_keywords = ['no', 'not', "can't", "won't", 'sorry', 'later', 'busy', 'another time']
+        refusal_keywords = ['no', 'not', "can't", "won't", 'sorry', 'later', 'busy',
+                            'another time', '不行', '不能', '没空', '忙', '算了', '不要']
         if any(kw in content_lower for kw in refusal_keywords):
             return 'refusal'
         
         # Question
-        if '?' in content or '?' in content or content.endswith(('?', '??')):
+        if '?' in content or '？' in content or content.endswith(('?', '？', '??')):
             return 'question'
         
         # Explanation (longer messages)
-        if len(content) > 100 and ('because' in content_lower or 'since' in content_lower or 'so' in content_lower):
+        if len(content) > 50 and ('because' in content_lower or 'since' in content_lower or
+                                   'so' in content_lower or '因为' in content or '所以' in content or
+                                   '由于' in content):
             return 'explanation'
         
         return 'casual'
@@ -327,8 +375,16 @@ class SkillDistiller:
         return scenarios.get(category, 'General conversation')
     
     def analyze_style_with_llm(self, stats: StyleStatistics, sample_messages: List[str]) -> StyleAnalysis:
-        """Use LLM to analyze communication style"""
-        
+        """Use LLM to analyze communication style, with rule-based fallback"""
+        if self.api_key:
+            try:
+                return self._analyze_style_with_llm_api(stats, sample_messages)
+            except Exception:
+                pass
+        return self._analyze_style_rule_based(stats, sample_messages)
+
+    def _analyze_style_with_llm_api(self, stats: StyleStatistics, sample_messages: List[str]) -> StyleAnalysis:
+        """Use LLM API to analyze communication style"""
         prompt = f"""Analyze the following communication style based on chat history samples and statistics.
 
 Statistics:
@@ -352,69 +408,211 @@ Please analyze and describe:
 Output as JSON:
 {{"tone": "...", "formality": "...", "humor_style": "...", "sentence_structure": "...", "vocabulary_level": "...", "emotional_expression": "...", "response_patterns": ["...", "..."]}}"""
 
-        try:
-            response = self._call_llm(prompt)
-            # Parse JSON from response
-            json_match = re.search(r'\{[^}]+\}', response, re.DOTALL)
-            if json_match:
-                data = json.loads(json_match.group())
-                return StyleAnalysis(
-                    tone=data.get('tone', ''),
-                    formality=data.get('formality', ''),
-                    humor_style=data.get('humor_style', ''),
-                    sentence_structure=data.get('sentence_structure', ''),
-                    vocabulary_level=data.get('vocabulary_level', ''),
-                    emotional_expression=data.get('emotional_expression', ''),
-                    response_patterns=data.get('response_patterns', [])
-                )
-        except Exception as e:
-            print(f"LLM analysis error: {e}")
-        
+        response = self._call_llm(prompt)
+        json_match = re.search(r'\{[^}]+\}', response, re.DOTALL)
+        if json_match:
+            data = json.loads(json_match.group())
+            return StyleAnalysis(
+                tone=data.get('tone', ''),
+                formality=data.get('formality', ''),
+                humor_style=data.get('humor_style', ''),
+                sentence_structure=data.get('sentence_structure', ''),
+                vocabulary_level=data.get('vocabulary_level', ''),
+                emotional_expression=data.get('emotional_expression', ''),
+                response_patterns=data.get('response_patterns', [])
+            )
         return StyleAnalysis()
+
+    def _analyze_style_rule_based(self, stats: StyleStatistics, sample_messages: List[str]) -> StyleAnalysis:
+        """Rule-based style analysis when no LLM API is available"""
+        analysis = StyleAnalysis()
+
+        # Tone: based on emoji usage and message length
+        emoji_count = sum(stats.emoji_usage.values())
+        emoji_ratio = emoji_count / max(stats.total_messages, 1)
+        if emoji_ratio > 0.3:
+            analysis.tone = "friendly and casual"
+        elif emoji_ratio > 0.1:
+            analysis.tone = "friendly, mix of casual and professional"
+        else:
+            analysis.tone = "professional and direct"
+
+        # Formality: based on average message length and vocabulary
+        if stats.avg_message_length < 15:
+            analysis.formality = "very casual"
+        elif stats.avg_message_length < 30:
+            analysis.formality = "casual"
+        elif stats.avg_message_length < 60:
+            analysis.formality = "neutral"
+        elif stats.avg_message_length < 100:
+            analysis.formality = "somewhat formal"
+        else:
+            analysis.formality = "formal"
+
+        # Humor: based on emoji variety
+        if len(stats.emoji_usage) > 10:
+            analysis.humor_style = "witty and playful"
+        elif emoji_ratio > 0.2:
+            analysis.humor_style = "silly"
+        else:
+            analysis.humor_style = "subtle or none"
+
+        # Sentence structure
+        if stats.avg_message_length < 20:
+            analysis.sentence_structure = "short and punchy"
+        elif stats.avg_message_length < 50:
+            analysis.sentence_structure = "medium length"
+        else:
+            analysis.sentence_structure = "detailed and long"
+
+        # Vocabulary
+        tech_words = [w for w in stats.top_words if w in
+                     ['code', 'bug', 'api', 'function', 'error', 'fix', 'deploy', 'server',
+                      'config', 'debug', 'test', 'python', 'java', 'javascript']]
+        if len(tech_words) > 5:
+            analysis.vocabulary_level = "technical"
+        elif stats.avg_message_length > 60:
+            analysis.vocabulary_level = "sophisticated"
+        elif stats.avg_message_length > 30:
+            analysis.vocabulary_level = "moderate"
+        else:
+            analysis.vocabulary_level = "simple and concise"
+
+        # Emotional expression
+        if emoji_ratio > 0.3:
+            analysis.emotional_expression = "expressive"
+        elif emoji_ratio > 0.1:
+            analysis.emotional_expression = "moderate"
+        else:
+            analysis.emotional_expression = "reserved"
+
+        # Response patterns from samples
+        patterns = []
+        if sample_messages:
+            starts = Counter()
+            for m in sample_messages[:50]:
+                m = m.strip()
+                if not m:
+                    continue
+                if m.startswith(('嗯', '好', 'OK', 'ok', '收到')):
+                    starts['acknowledgment'] += 1
+                elif m.startswith(('因为', '所以', '由于')):
+                    starts['explanation'] += 1
+                elif m.startswith(('@',)):
+                    starts['mention_reply'] += 1
+                elif '?' in m or '？' in m:
+                    starts['question'] += 1
+            for pattern_type, count in starts.most_common(3):
+                if pattern_type == 'acknowledgment':
+                    patterns.append("Often starts with acknowledgment (嗯/好/OK/收到)")
+                elif pattern_type == 'explanation':
+                    patterns.append("Tends to explain reasoning (因为/所以)")
+                elif pattern_type == 'mention_reply':
+                    patterns.append("Frequently uses @mentions to reply")
+                elif pattern_type == 'question':
+                    patterns.append("Often asks questions")
+        if not patterns:
+            patterns.append("Direct and to-the-point responses")
+        analysis.response_patterns = patterns
+
+        return analysis
     
-    def generate_system_prompt(self, stats: StyleStatistics, analysis: StyleAnalysis, examples: List[FewShotExample]) -> str:
-        """Generate system prompt for style imitation"""
-        
-        template = Template("""# Your Communication Style Profile
+    def generate_skill_body(self, stats: StyleStatistics, analysis: StyleAnalysis, examples: List[FewShotExample]) -> str:
+        """Generate SKILL.md body content following Agent Skills specification"""
+        # Precompute values
+        avg_len_int = int(round(stats.avg_message_length))
+        top_emojis = list(stats.emoji_usage.keys())[:5]
+        top_examples = examples[:8]
 
-You are imitating the communication style of a specific person based on their chat history.
+        # Build acknowledgment phrases section
+        ack_section = ""
+        ack_words = [w for w in ['嗯', '好', 'OK', 'ok', '收到', '好的', '哦哦'] if w in stats.top_words or w in top_emojis]
+        if ack_words:
+            ack_section = f"When acknowledging or confirming, prefer: {' / '.join(ack_words)}\n"
 
-## Language Style
-- **Tone**: {{ analysis.tone }}
-- **Formality**: {{ analysis.formality }}
-- **Humor**: {{ analysis.humor_style }}
-- **Sentence Structure**: {{ analysis.sentence_structure }}
-- **Vocabulary**: {{ analysis.vocabulary_level }}
-- **Emotional Expression**: {{ analysis.emotional_expression }}
+        # Build question style section
+        question_markers = [w for w in ['？', '?'] if w in stats.emoji_usage or w in stats.top_words]
 
-## Key Statistics
-- Average message length: {{ "%.1f"|format(stats.avg_message_length) }} characters
-- Typical emojis used: {{ stats.emoji_usage.keys()|list|join(", ")[:50] }}
-- Common words: {{ stats.top_words[:10]|join(", ") }}
+        # Build few-shot examples section
+        examples_section = ""
+        for ex in top_examples:
+            examples_section += f"- **{ex.scenario}**\n  Input: \"{ex.context}\"\n  Output: \"{ex.response}\"\n\n"
 
-## Response Patterns
-{% for pattern in analysis.response_patterns %}
-- {{ pattern }}
-{% endfor %}
+        # Build response patterns section
+        patterns_section = ""
+        for p in analysis.response_patterns:
+            patterns_section += f"- {p}\n"
 
-## Example Responses
-{% for example in examples[:5] %}
-**{{ example.scenario }}**
-Context: {{ example.context }}
-Response: {{ example.response }}
-{% endfor %}
+        # Build hourly distribution insights
+        hourly_section = ""
+        if stats.hourly_distribution:
+            sorted_hours = sorted(stats.hourly_distribution.items(), key=lambda x: x[1], reverse=True)
+            active_hours = [f"{h}:00" for h, _ in sorted_hours[:4]]
+            hourly_section = f"Most active hours: {', '.join(active_hours)}\n"
 
-## Guidelines for Imitation
-1. Keep messages around {{ "%.0f"|format(stats.avg_message_length) }} characters on average
-2. Use similar emoji style: {{ analysis.humor_style }}
-3. Match the {{ analysis.formality }} formality level
-4. Follow the typical response patterns shown above
-5. When uncertain, be {{ analysis.tone }} in tone
+        # Build message type distribution
+        type_section = ""
+        if stats.message_type_distribution:
+            total_msgs = sum(stats.message_type_distribution.values())
+            text_pct = stats.message_type_distribution.get('text', 0) / max(total_msgs, 1) * 100
+            sticker_pct = stats.message_type_distribution.get('sticker', 0) / max(total_msgs, 1) * 100
+            type_section = f"Text messages: {text_pct:.0f}%, Stickers/Emojis: {sticker_pct:.0f}%\n"
 
-Remember: You are not just responding - you are responding AS this person would, with their unique voice and style.
+        template = Template("""# WeChat Chat Style Imitation
+
+## When to use
+Use this skill when drafting or replying to messages in the user's WeChat communication style. Activate when the user asks you to write messages in their voice, auto-reply in their style, or simulate their chat behavior.
+
+## Style rules
+1. Keep messages around {{ avg_len }} characters on average — this person writes short, punchy messages
+2. Match the **{{ analysis.formality }}** formality level — avoid overly formal language
+3. Adopt a **{{ analysis.tone }}** tone
+4. Use **{{ analysis.sentence_structure }}** sentence structure — avoid long paragraphs
+5. Vocabulary is **{{ analysis.vocabulary_level }}** — be direct, not verbose
+6. Emotional expression is **{{ analysis.emotional_expression }}** — adjust emoji and exclamation usage accordingly
+{{ ack_section }}{{ hourly_section }}{{ type_section }}
+## Response patterns
+{{ patterns_section }}
+## How to respond in different scenarios
+
+### Technical discussions
+- Be concise and precise; state facts directly without hedging
+- Use technical terms naturally without over-explaining
+- If you know the answer, say it flatly — don't pad with "I think" or "maybe"
+
+### Casual conversation
+- Keep it brief — one or two short sentences max
+- Don't over-elaborate; this person doesn't write essays in chat
+
+### Agreeing or confirming
+- Use short acknowledgment words, not full sentences
+- Avoid repeating back what was said — just confirm
+
+### Declining or pushing back
+- Be direct but not rude — raise the concern as a question
+- Prefer "can we do X instead?" over "no, I don't want to"
+
+### Asking questions
+- Keep questions short and specific
+- Prefer direct questions over indirect framing
+
+## Few-shot examples
+{{ examples_section }}
+## Gotchas
+- Do NOT write long paragraphs — this person's average message is {{ avg_len }} characters
+- Do NOT use formal honorifics or polite filler — the style is very casual
+- Do NOT over-explain — if the answer is simple, give it simply
+- DO use acknowledgment words (嗯/好/OK/收到) liberally
+- DO use @mentions when replying to specific people in group chats
+- DO match the brevity — when in doubt, make it shorter
 """)
-        
-        return template.render(stats=stats, analysis=analysis, examples=examples)
+
+        return template.render(
+            analysis=analysis, avg_len=avg_len_int,
+            ack_section=ack_section, hourly_section=hourly_section,
+            type_section=type_section, patterns_section=patterns_section,
+            examples_section=examples_section,
+        )
     
     def _call_llm(self, prompt: str) -> str:
         """Call LLM API"""
@@ -452,37 +650,47 @@ Remember: You are not just responding - you are responding AS this person would,
         all_messages = []
         all_my_messages = []
         
+        errors = []
         for chat_name in chat_names:
-            messages = self.fetch_chat_history(chat_name, limit=message_limit)
-            all_messages.extend(messages)
-            all_my_messages.extend(self.filter_my_messages(messages))
+            try:
+                messages = self.fetch_chat_history(chat_name, limit=message_limit)
+                all_messages.extend(messages)
+                all_my_messages.extend(self.filter_my_messages(messages))
+            except Exception as e:
+                errors.append(f"{chat_name}: {e}")
         
         if not all_my_messages:
-            raise ValueError("No messages found to distill")
+            detail = "; ".join(errors) if errors else "no self-sent messages found"
+            raise ValueError(f"No messages found to distill ({detail})")
+
+        # Use text-only messages for style analysis
+        my_text_messages = self.filter_my_messages(all_messages, text_only=True)
+        if not my_text_messages:
+            my_text_messages = all_my_messages
         
-        # Calculate statistics
-        stats = self.calculate_statistics(all_messages, all_my_messages)
+        # Calculate statistics (text-only for cleaner data)
+        stats = self.calculate_statistics(all_messages, my_text_messages)
         
-        # Extract few-shot examples
-        examples = self.extract_few_shots(all_my_messages, all_messages)
+        # Extract few-shot examples (text-only)
+        examples = self.extract_few_shots(my_text_messages, all_messages)
         
-        # Analyze style with LLM
-        sample_messages = [m.get('content', '') for m in all_my_messages[:50]]
+        # Analyze style with LLM (text-only samples)
+        sample_messages = [m.get('content', '') for m in my_text_messages[:50]]
         analysis = self.analyze_style_with_llm(stats, sample_messages)
         
-        # Generate system prompt
-        system_prompt = self.generate_system_prompt(stats, analysis, examples)
+        # Generate SKILL.md body content
+        skill_body = self.generate_skill_body(stats, analysis, examples)
         
         # Build skill
         skill = DistilledSkill(
             profile={
-                "name": "User",
+                "name": "wechat-chat-style",
                 "style_summary": f"{analysis.tone}, {analysis.formality}, {analysis.sentence_structure}"
             },
             statistics=stats,
             style_analysis=analysis,
             few_shot_examples=examples,
-            system_prompt=system_prompt,
+            system_prompt=skill_body,
             created_at=datetime.now().isoformat(),
             source_chats=chat_names
         )
@@ -490,73 +698,70 @@ Remember: You are not just responding - you are responding AS this person would,
         return skill
     
     def to_json(self, skill: DistilledSkill) -> str:
-        """Convert skill to JSON string"""
-        return json.dumps(asdict(skill), ensure_ascii=False, indent=2)
+        """Convert skill to JSON string, including Agent Skills compliant SKILL.md"""
+        data = asdict(skill)
+        # Add the Agent Skills compliant SKILL.md content
+        data['skill_md'] = self.to_markdown(skill)
+        return json.dumps(data, ensure_ascii=False, indent=2)
     
     def to_markdown(self, skill: DistilledSkill) -> str:
-        """Convert skill to Markdown format"""
-        template = Template("""# Communication Style Profile
+        """Convert skill to Agent Skills compliant SKILL.md format"""
+        # Build YAML frontmatter
+        skill_name = skill.profile.get('name', 'wechat-chat-style')
+        # Ensure name conforms to spec: lowercase alphanumeric + hyphens
+        skill_name = re.sub(r'[^a-z0-9-]', '-', skill_name.lower())
+        skill_name = re.sub(r'-+', '-', skill_name).strip('-')
+        if not skill_name:
+            skill_name = 'wechat-chat-style'
 
-> Generated: {{ skill.created_at }}
-> Source chats: {{ skill.source_chats|join(", ") }}
+        description = (
+            f"Imitate the user's WeChat communication style when drafting or replying to messages. "
+            f"Use when the user asks you to write messages in their voice, auto-reply in their style, "
+            f"or simulate their chat behavior. Style: {skill.style_analysis.tone}, "
+            f"{skill.style_analysis.formality}, {skill.style_analysis.sentence_structure}."
+        )
+        # Truncate description to 1024 chars per spec
+        if len(description) > 1024:
+            description = description[:1020] + "..."
 
-## Style Summary
+        # Build metadata
+        source_chats_str = ", ".join(skill.source_chats[:5])
+        if len(skill.source_chats) > 5:
+            source_chats_str += f" (+{len(skill.source_chats) - 5} more)"
 
-**{{ skill.profile.style_summary }}**
+        frontmatter = f"""---
+name: {skill_name}
+description: {description}
+metadata:
+  author: wechat-cli
+  version: "1.0"
+  source-chats: "{source_chats_str}"
+  created-at: "{skill.created_at}"
+  total-messages: "{skill.statistics.total_messages}"
+---"""
 
-## Statistics
+        # Body is the skill_body stored in system_prompt field
+        body = skill.system_prompt
 
-- **Total messages analyzed**: {{ skill.statistics.total_messages }}
-- **Average message length**: {{ "%.1f"|format(skill.statistics.avg_message_length) }} characters
-- **Top emojis**: {{ skill.statistics.emoji_usage.keys()|list|join(", ")[:50] }}
-- **Common words**: {{ skill.statistics.top_words[:10]|join(", ") }}
-
-## Style Analysis
-
-| Aspect | Description |
-|--------|-------------|
-| Tone | {{ skill.style_analysis.tone }} |
-| Formality | {{ skill.style_analysis.formality }} |
-| Humor | {{ skill.style_analysis.humor_style }} |
-| Sentence Structure | {{ skill.style_analysis.sentence_structure }} |
-| Vocabulary | {{ skill.style_analysis.vocabulary_level }} |
-| Emotional Expression | {{ skill.style_analysis.emotional_expression }} |
-
-## Response Patterns
-
-{% for pattern in skill.style_analysis.response_patterns %}
-- {{ pattern }}
-{% endfor %}
-
-## Example Responses
-
-{% for example in skill.few_shot_examples[:5] %}
-### {{ example.scenario }}
-
-**Context**: {{ example.context }}
-
-**Response**: {{ example.response }}
-
-{% endfor %}
-
----
-
-## System Prompt
-
-```
-{{ skill.system_prompt }}
-```
-""")
-        return template.render(skill=skill)
+        return frontmatter + "\n" + body
     
-    def save_skill(self, skill: DistilledSkill, output_path: str, format: str = "json"):
-        """Save skill to file"""
+    def save_skill(self, skill: DistilledSkill, output_path: str, format: str = "markdown"):
+        """Save skill to file, defaulting to Agent Skills compliant SKILL.md"""
         path = Path(output_path)
-        
+
         if format == "json":
             content = self.to_json(skill)
         else:
             content = self.to_markdown(skill)
-        
+            # Agent Skills spec: markdown output should be named SKILL.md
+            if path.is_dir():
+                path = path / "SKILL.md"
+            elif not path.name.endswith('.md'):
+                # If path is a file but not .md, create a directory and put SKILL.md inside
+                skill_dir = path.parent / path.stem if path.suffix else path
+                skill_dir.mkdir(parents=True, exist_ok=True)
+                path = skill_dir / "SKILL.md"
+
+        path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding='utf-8')
         return str(path)

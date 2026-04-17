@@ -541,17 +541,17 @@ def wechat_favorites(msg_type: str = None, query: str = None) -> str:
 def wechat_distill_skill(
     chat_names: str,
     message_limit: int = 500,
-    output_format: str = "json"
+    output_format: str = "markdown"
 ) -> str:
-    """Distill personal communication style from chat history.
+    """Distill personal communication style from chat history into an Agent Skills compliant SKILL.md.
     
     Args:
         chat_names: Comma-separated list of chat names to analyze
         message_limit: Maximum messages to analyze per chat
-        output_format: 'json' or 'markdown'
+        output_format: 'markdown' (Agent Skills SKILL.md) or 'json'
     
     Returns:
-        Distilled skill data including style analysis, statistics, and few-shot examples
+        Agent Skills compliant skill data with YAML frontmatter, style rules, and few-shot examples
     """
     try:
         from .distill import SkillDistiller
@@ -577,18 +577,18 @@ def wechat_save_skill(
     chat_names: str,
     output_path: str,
     message_limit: int = 500,
-    output_format: str = "json"
+    output_format: str = "markdown"
 ) -> str:
-    """Distill and save skill to file.
+    """Distill and save skill to file as Agent Skills compliant SKILL.md.
     
     Args:
         chat_names: Comma-separated list of chat names
-        output_path: Path to save the skill file
+        output_path: Path to save the skill file (will create SKILL.md per Agent Skills spec)
         message_limit: Maximum messages per chat
-        output_format: 'json' or 'markdown'
+        output_format: 'markdown' (Agent Skills SKILL.md) or 'json'
     
     Returns:
-        Path to saved file or error message
+        Path to saved SKILL.md file or error message
     """
     try:
         from .distill import SkillDistiller
